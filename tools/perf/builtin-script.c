@@ -1,18 +1,24 @@
 #include "builtin.h"
 
-#include "util/util.h"
+#include "perf.h"
 #include "util/cache.h"
+#include "util/debug.h"
+#include "util/exec_cmd.h"
+#include "util/header.h"
+#include "util/parse-options.h"
+#include "util/session.h"
 #include "util/symbol.h"
 #include "util/thread.h"
-#include "util/header.h"
-#include "util/exec_cmd.h"
 #include "util/trace-event.h"
-#include "util/session.h"
+#include "util/parse-options.h"
+#include "util/util.h"
 
 static char const		*script_name;
 static char const		*generate_script_lang;
-static bool			debug_ordering;
+static bool			debug_mode;
 static u64			last_timestamp;
+static u64			nr_unordered;
+extern const struct option	record_options[];
 
 static int default_start_script(const char *script __unused,
 				int argc __unused,
@@ -42,9 +48,6 @@ static struct scripting_ops	*scripting_ops;
 
 static void setup_scripting(void)
 {
-	/* make sure PERF_EXEC_PATH is set for scripts */
-	perf_set_argv_exec_path(perf_exec_path());
-
 	setup_perl_scripting();
 	setup_python_scripting();
 
@@ -53,37 +56,18 @@ static void setup_scripting(void)
 
 static int cleanup_scripting(void)
 {
-	pr_debug("\nperf trace script stopped\n");
+	pr_debug("\nperf script stopped\n");
 
 	return scripting_ops->stop_script();
 }
 
-#include "util/parse-options.h"
-
-#include "perf.h"
-#include "util/debug.h"
-
-#include "util/trace-event.h"
-#include "util/exec_cmd.h"
-
 static char const		*input_name = "perf.data";
 
-static int process_sample_event(event_t *event, struct perf_session *session)
+static int process_sample_event(event_t *event, struct sample_data *sample,
+				struct perf_session *session)
 {
-	struct sample_data data;
-	struct thread *thread;
+	struct thread *thread = perf_session__findnew(session, event->ip.pid);
 
-	memset(&data, 0, sizeof(data));
-	data.time = -1;
-	data.cpu = -1;
-	data.period = 1;
-
-	event__parse_sample(event, session->sample_type, &data);
-
-	dump_printf("(IP, %d): %d/%d: %#Lx period: %Ld\n", event->header.misc,
-		    data.pid, data.tid, data.ip, data.period);
-
-	thread = perf_session__findnew(session, event->ip.pid);
 	if (thread == NULL) {
 		pr_debug("problem processing %d event, skipping it.\n",
 			 event->header.type);
@@ -91,25 +75,27 @@ static int process_sample_event(event_t *event, struct perf_session *session)
 	}
 
 	if (session->sample_type & PERF_SAMPLE_RAW) {
-		if (debug_ordering) {
-			if (data.time < last_timestamp) {
-				pr_err("Samples misordered, previous: %llu "
-					"this: %llu\n", last_timestamp,
-					data.time);
+		if (debug_mode) {
+			if (sample->time < last_timestamp) {
+				pr_err("Samples misordered, previous: %" PRIu64
+					" this: %" PRIu64 "\n", last_timestamp,
+					sample->time);
+				nr_unordered++;
 			}
-			last_timestamp = data.time;
+			last_timestamp = sample->time;
+			return 0;
 		}
 		/*
 		 * FIXME: better resolve from pid from the struct trace_entry
 		 * field, although it should be the same than this perf
 		 * event pid
 		 */
-		scripting_ops->process_event(data.cpu, data.raw_data,
-					     data.raw_size,
-					     data.time, thread->comm);
+		scripting_ops->process_event(sample->cpu, sample->raw_data,
+					     sample->raw_size,
+					     sample->time, thread->comm);
 	}
 
-	session->hists.stats.total_period += data.period;
+	session->hists.stats.total_period += sample->period;
 	return 0;
 }
 
@@ -120,6 +106,7 @@ static struct perf_event_ops event_ops = {
 	.event_type = event__process_event_type,
 	.tracing_data = event__process_tracing_data,
 	.build_id = event__process_build_id,
+	.ordering_requires_timestamps = true,
 	.ordered_samples = true,
 };
 
@@ -130,11 +117,18 @@ static void sig_handler(int sig __unused)
 	session_done = 1;
 }
 
-static int __cmd_trace(struct perf_session *session)
+static int __cmd_script(struct perf_session *session)
 {
+	int ret;
+
 	signal(SIGINT, sig_handler);
 
-	return perf_session__process_events(session, &event_ops);
+	ret = perf_session__process_events(session, &event_ops);
+
+	if (debug_mode)
+		pr_err("Misordered timestamps: %" PRIu64 "\n", nr_unordered);
+
+	return ret;
 }
 
 struct script_spec {
@@ -143,7 +137,7 @@ struct script_spec {
 	char			spec[0];
 };
 
-LIST_HEAD(script_specs);
+static LIST_HEAD(script_specs);
 
 static struct script_spec *script_spec__new(const char *spec,
 					    struct scripting_ops *ops)
@@ -231,7 +225,7 @@ static void list_available_languages(void)
 
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Scripting language extensions (used in "
-		"perf trace -s [spec:]script.[spec]):\n\n");
+		"perf script -s [spec:]script.[spec]):\n\n");
 
 	list_for_each_entry(s, &script_specs, node)
 		fprintf(stderr, "  %-42s [%s]\n", s->spec, s->ops->name);
@@ -268,7 +262,7 @@ static int parse_scriptname(const struct option *opt __used,
 		script++;
 	} else {
 		script = str;
-		ext = strchr(script, '.');
+		ext = strrchr(script, '.');
 		if (!ext) {
 			fprintf(stderr, "invalid script extension");
 			return -1;
@@ -285,17 +279,34 @@ static int parse_scriptname(const struct option *opt __used,
 	return 0;
 }
 
-#define for_each_lang(scripts_dir, lang_dirent, lang_next)		\
+/* Helper function for filesystems that return a dent->d_type DT_UNKNOWN */
+static int is_directory(const char *base_path, const struct dirent *dent)
+{
+	char path[PATH_MAX];
+	struct stat st;
+
+	sprintf(path, "%s/%s", base_path, dent->d_name);
+	if (stat(path, &st))
+		return 0;
+
+	return S_ISDIR(st.st_mode);
+}
+
+#define for_each_lang(scripts_path, scripts_dir, lang_dirent, lang_next)\
 	while (!readdir_r(scripts_dir, &lang_dirent, &lang_next) &&	\
 	       lang_next)						\
-		if (lang_dirent.d_type == DT_DIR &&			\
+		if ((lang_dirent.d_type == DT_DIR ||			\
+		     (lang_dirent.d_type == DT_UNKNOWN &&		\
+		      is_directory(scripts_path, &lang_dirent))) &&	\
 		    (strcmp(lang_dirent.d_name, ".")) &&		\
 		    (strcmp(lang_dirent.d_name, "..")))
 
-#define for_each_script(lang_dir, script_dirent, script_next)		\
+#define for_each_script(lang_path, lang_dir, script_dirent, script_next)\
 	while (!readdir_r(lang_dir, &script_dirent, &script_next) &&	\
 	       script_next)						\
-		if (script_dirent.d_type != DT_DIR)
+		if (script_dirent.d_type != DT_DIR &&			\
+		    (script_dirent.d_type != DT_UNKNOWN ||		\
+		     !is_directory(lang_path, &script_dirent)))
 
 
 #define RECORD_SUFFIX			"-record"
@@ -308,13 +319,13 @@ struct script_desc {
 	char			*args;
 };
 
-LIST_HEAD(script_descs);
+static LIST_HEAD(script_descs);
 
 static struct script_desc *script_desc__new(const char *name)
 {
 	struct script_desc *s = zalloc(sizeof(*s));
 
-	if (s != NULL)
+	if (s != NULL && name)
 		s->name = strdup(name);
 
 	return s;
@@ -323,6 +334,8 @@ static struct script_desc *script_desc__new(const char *name)
 static void script_desc__delete(struct script_desc *s)
 {
 	free(s->name);
+	free(s->half_liner);
+	free(s->args);
 	free(s);
 }
 
@@ -362,10 +375,10 @@ out_delete_desc:
 	return NULL;
 }
 
-static char *ends_with(char *str, const char *suffix)
+static const char *ends_with(const char *str, const char *suffix)
 {
 	size_t suffix_len = strlen(suffix);
-	char *p = str;
+	const char *p = str;
 
 	if (strlen(str) > suffix_len) {
 		p = str + strlen(str) - suffix_len;
@@ -448,16 +461,16 @@ static int list_available_scripts(const struct option *opt __used,
 	if (!scripts_dir)
 		return -1;
 
-	for_each_lang(scripts_dir, lang_dirent, lang_next) {
+	for_each_lang(scripts_path, scripts_dir, lang_dirent, lang_next) {
 		snprintf(lang_path, MAXPATHLEN, "%s/%s/bin", scripts_path,
 			 lang_dirent.d_name);
 		lang_dir = opendir(lang_path);
 		if (!lang_dir)
 			continue;
 
-		for_each_script(lang_dir, script_dirent, script_next) {
+		for_each_script(lang_path, lang_dir, script_dirent, script_next) {
 			script_root = strdup(script_dirent.d_name);
-			str = ends_with(script_root, REPORT_SUFFIX);
+			str = (char *)ends_with(script_root, REPORT_SUFFIX);
 			if (str) {
 				*str = '\0';
 				desc = script_desc__findnew(script_root);
@@ -496,16 +509,16 @@ static char *get_script_path(const char *script_root, const char *suffix)
 	if (!scripts_dir)
 		return NULL;
 
-	for_each_lang(scripts_dir, lang_dirent, lang_next) {
+	for_each_lang(scripts_path, scripts_dir, lang_dirent, lang_next) {
 		snprintf(lang_path, MAXPATHLEN, "%s/%s/bin", scripts_path,
 			 lang_dirent.d_name);
 		lang_dir = opendir(lang_path);
 		if (!lang_dir)
 			continue;
 
-		for_each_script(lang_dir, script_dirent, script_next) {
+		for_each_script(lang_path, lang_dir, script_dirent, script_next) {
 			__script_root = strdup(script_dirent.d_name);
-			str = ends_with(__script_root, suffix);
+			str = (char *)ends_with(__script_root, suffix);
 			if (str) {
 				*str = '\0';
 				if (strcmp(__script_root, script_root))
@@ -523,8 +536,40 @@ static char *get_script_path(const char *script_root, const char *suffix)
 	return path;
 }
 
-static const char * const trace_usage[] = {
-	"perf trace [<options>] <command>",
+static bool is_top_script(const char *script_path)
+{
+	return ends_with(script_path, "top") == NULL ? false : true;
+}
+
+static int has_required_arg(char *script_path)
+{
+	struct script_desc *desc;
+	int n_args = 0;
+	char *p;
+
+	desc = script_desc__new(NULL);
+
+	if (read_script_info(desc, script_path))
+		goto out;
+
+	if (!desc->args)
+		goto out;
+
+	for (p = desc->args; *p; p++)
+		if (*p == '<')
+			n_args++;
+out:
+	script_desc__delete(desc);
+
+	return n_args;
+}
+
+static const char * const script_usage[] = {
+	"perf script [<options>]",
+	"perf script [<options>] record <script> [<record-options>] <command>",
+	"perf script [<options>] report <script> [script-args]",
+	"perf script [<options>] <script> [<record-options>] <command>",
+	"perf script [<options>] <top-script> [script-args]",
 	NULL
 };
 
@@ -541,56 +586,90 @@ static const struct option options[] = {
 		     "script file name (lang:script name, script name, or *)",
 		     parse_scriptname),
 	OPT_STRING('g', "gen-script", &generate_script_lang, "lang",
-		   "generate perf-trace.xx script in specified language"),
+		   "generate perf-script.xx script in specified language"),
 	OPT_STRING('i', "input", &input_name, "file",
 		    "input file name"),
-	OPT_BOOLEAN('d', "debug-ordering", &debug_ordering,
-		   "check that samples time ordering is monotonic"),
+	OPT_BOOLEAN('d', "debug-mode", &debug_mode,
+		   "do various checks like samples ordering and lost events"),
 
 	OPT_END()
 };
 
-int cmd_trace(int argc, const char **argv, const char *prefix __used)
+static bool have_cmd(int argc, const char **argv)
 {
+	char **__argv = malloc(sizeof(const char *) * argc);
+
+	if (!__argv)
+		die("malloc");
+	memcpy(__argv, argv, sizeof(const char *) * argc);
+	argc = parse_options(argc, (const char **)__argv, record_options,
+			     NULL, PARSE_OPT_STOP_AT_NON_OPTION);
+	free(__argv);
+
+	return argc != 0;
+}
+
+int cmd_script(int argc, const char **argv, const char *prefix __used)
+{
+	char *rec_script_path = NULL;
+	char *rep_script_path = NULL;
 	struct perf_session *session;
-	const char *suffix = NULL;
+	char *script_path = NULL;
 	const char **__argv;
-	char *script_path;
-	int i, err;
+	bool system_wide;
+	int i, j, err;
 
-	if (argc >= 2 && strncmp(argv[1], "rec", strlen("rec")) == 0) {
-		if (argc < 3) {
-			fprintf(stderr,
-				"Please specify a record script\n");
-			return -1;
-		}
-		suffix = RECORD_SUFFIX;
+	setup_scripting();
+
+	argc = parse_options(argc, argv, options, script_usage,
+			     PARSE_OPT_STOP_AT_NON_OPTION);
+
+	if (argc > 1 && !strncmp(argv[0], "rec", strlen("rec"))) {
+		rec_script_path = get_script_path(argv[1], RECORD_SUFFIX);
+		if (!rec_script_path)
+			return cmd_record(argc, argv, NULL);
 	}
 
-	if (argc >= 2 && strncmp(argv[1], "rep", strlen("rep")) == 0) {
-		if (argc < 3) {
+	if (argc > 1 && !strncmp(argv[0], "rep", strlen("rep"))) {
+		rep_script_path = get_script_path(argv[1], REPORT_SUFFIX);
+		if (!rep_script_path) {
 			fprintf(stderr,
-				"Please specify a report script\n");
+				"Please specify a valid report script"
+				"(see 'perf script -l' for listing)\n");
 			return -1;
 		}
-		suffix = REPORT_SUFFIX;
 	}
 
-	if (!suffix && argc >= 2 && strncmp(argv[1], "-", strlen("-")) != 0) {
-		char *record_script_path, *report_script_path;
+	/* make sure PERF_EXEC_PATH is set for scripts */
+	perf_set_argv_exec_path(perf_exec_path());
+
+	if (argc && !script_name && !rec_script_path && !rep_script_path) {
 		int live_pipe[2];
+		int rep_args;
 		pid_t pid;
 
-		record_script_path = get_script_path(argv[1], RECORD_SUFFIX);
-		if (!record_script_path) {
-			fprintf(stderr, "record script not found\n");
-			return -1;
+		rec_script_path = get_script_path(argv[0], RECORD_SUFFIX);
+		rep_script_path = get_script_path(argv[0], REPORT_SUFFIX);
+
+		if (!rec_script_path && !rep_script_path) {
+			fprintf(stderr, " Couldn't find script %s\n\n See perf"
+				" script -l for available scripts.\n", argv[0]);
+			usage_with_options(script_usage, options);
 		}
 
-		report_script_path = get_script_path(argv[1], REPORT_SUFFIX);
-		if (!report_script_path) {
-			fprintf(stderr, "report script not found\n");
-			return -1;
+		if (is_top_script(argv[0])) {
+			rep_args = argc - 1;
+		} else {
+			int rec_args;
+
+			rep_args = has_required_arg(rep_script_path);
+			rec_args = (argc - 1) - rep_args;
+			if (rec_args < 0) {
+				fprintf(stderr, " %s script requires options."
+					"\n\n See perf script -l for available "
+					"scripts and options.\n", argv[0]);
+				usage_with_options(script_usage, options);
+			}
 		}
 
 		if (pipe(live_pipe) < 0) {
@@ -605,65 +684,90 @@ int cmd_trace(int argc, const char **argv, const char *prefix __used)
 		}
 
 		if (!pid) {
+			system_wide = true;
+			j = 0;
+
 			dup2(live_pipe[1], 1);
 			close(live_pipe[0]);
 
-			__argv = malloc(5 * sizeof(const char *));
-			__argv[0] = "/bin/sh";
-			__argv[1] = record_script_path;
-			__argv[2] = "-o";
-			__argv[3] = "-";
-			__argv[4] = NULL;
+			if (!is_top_script(argv[0]))
+				system_wide = !have_cmd(argc - rep_args,
+							&argv[rep_args]);
+
+			__argv = malloc((argc + 6) * sizeof(const char *));
+			if (!__argv)
+				die("malloc");
+
+			__argv[j++] = "/bin/sh";
+			__argv[j++] = rec_script_path;
+			if (system_wide)
+				__argv[j++] = "-a";
+			__argv[j++] = "-q";
+			__argv[j++] = "-o";
+			__argv[j++] = "-";
+			for (i = rep_args + 1; i < argc; i++)
+				__argv[j++] = argv[i];
+			__argv[j++] = NULL;
 
 			execvp("/bin/sh", (char **)__argv);
+			free(__argv);
 			exit(-1);
 		}
 
 		dup2(live_pipe[0], 0);
 		close(live_pipe[1]);
 
-		__argv = malloc((argc + 3) * sizeof(const char *));
-		__argv[0] = "/bin/sh";
-		__argv[1] = report_script_path;
+		__argv = malloc((argc + 4) * sizeof(const char *));
+		if (!__argv)
+			die("malloc");
+		j = 0;
+		__argv[j++] = "/bin/sh";
+		__argv[j++] = rep_script_path;
+		for (i = 1; i < rep_args + 1; i++)
+			__argv[j++] = argv[i];
+		__argv[j++] = "-i";
+		__argv[j++] = "-";
+		__argv[j++] = NULL;
+
+		execvp("/bin/sh", (char **)__argv);
+		free(__argv);
+		exit(-1);
+	}
+
+	if (rec_script_path)
+		script_path = rec_script_path;
+	if (rep_script_path)
+		script_path = rep_script_path;
+
+	if (script_path) {
+		system_wide = false;
+		j = 0;
+
+		if (rec_script_path)
+			system_wide = !have_cmd(argc - 1, &argv[1]);
+
+		__argv = malloc((argc + 2) * sizeof(const char *));
+		if (!__argv)
+			die("malloc");
+		__argv[j++] = "/bin/sh";
+		__argv[j++] = script_path;
+		if (system_wide)
+			__argv[j++] = "-a";
 		for (i = 2; i < argc; i++)
-			__argv[i] = argv[i];
-		__argv[i++] = "-i";
-		__argv[i++] = "-";
-		__argv[i++] = NULL;
+			__argv[j++] = argv[i];
+		__argv[j++] = NULL;
 
 		execvp("/bin/sh", (char **)__argv);
+		free(__argv);
 		exit(-1);
 	}
-
-	if (suffix) {
-		script_path = get_script_path(argv[2], suffix);
-		if (!script_path) {
-			fprintf(stderr, "script not found\n");
-			return -1;
-		}
-
-		__argv = malloc((argc + 1) * sizeof(const char *));
-		__argv[0] = "/bin/sh";
-		__argv[1] = script_path;
-		for (i = 3; i < argc; i++)
-			__argv[i - 1] = argv[i];
-		__argv[argc - 1] = NULL;
-
-		execvp("/bin/sh", (char **)__argv);
-		exit(-1);
-	}
-
-	setup_scripting();
-
-	argc = parse_options(argc, argv, options, trace_usage,
-			     PARSE_OPT_STOP_AT_NON_OPTION);
 
 	if (symbol__init() < 0)
 		return -1;
 	if (!script_name)
 		setup_pager();
 
-	session = perf_session__new(input_name, O_RDONLY, 0, false);
+	session = perf_session__new(input_name, O_RDONLY, 0, false, &event_ops);
 	if (session == NULL)
 		return -ENOMEM;
 
@@ -697,7 +801,7 @@ int cmd_trace(int argc, const char **argv, const char *prefix __used)
 			return -1;
 		}
 
-		err = scripting_ops->generate_script("perf-trace");
+		err = scripting_ops->generate_script("perf-script");
 		goto out;
 	}
 
@@ -705,10 +809,10 @@ int cmd_trace(int argc, const char **argv, const char *prefix __used)
 		err = scripting_ops->start_script(script_name, argc, argv);
 		if (err)
 			goto out;
-		pr_debug("perf trace started with script %s\n\n", script_name);
+		pr_debug("perf script started with script %s\n\n", script_name);
 	}
 
-	err = __cmd_trace(session);
+	err = __cmd_script(session);
 
 	perf_session__delete(session);
 	cleanup_scripting();
