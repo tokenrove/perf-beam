@@ -3,11 +3,11 @@
 #include <newt.h>
 #include <inttypes.h>
 #include <sys/ttydefaults.h>
-#include <ctype.h>
 #include <string.h>
 #include <linux/bitops.h>
-#include "../../debug.h"
-#include "../../symbol.h"
+#include "../../util/util.h"
+#include "../../util/debug.h"
+#include "../../util/symbol.h"
 #include "../browser.h"
 #include "../helpline.h"
 #include "map.h"
