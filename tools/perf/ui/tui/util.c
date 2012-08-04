@@ -1,17 +1,17 @@
-#include "../util.h"
+#include "../../util/util.h"
 #include <signal.h>
 #include <stdbool.h>
 #include <string.h>
 #include <sys/ttydefaults.h>
 
-#include "../cache.h"
-#include "../debug.h"
-#include "browser.h"
-#include "keysyms.h"
-#include "helpline.h"
-#include "ui.h"
-#include "util.h"
-#include "libslang.h"
+#include "../../util/cache.h"
+#include "../../util/debug.h"
+#include "../browser.h"
+#include "../keysyms.h"
+#include "../helpline.h"
+#include "../ui.h"
+#include "../util.h"
+#include "../libslang.h"
 
 static void ui_browser__argv_write(struct ui_browser *browser,
 				   void *entry, int row)
@@ -208,11 +208,11 @@ int ui__dialog_yesno(const char *msg)
 	return ui__question_window(NULL, msg, "Enter: Yes, ESC: No", 0);
 }
 
-int __ui__warning(const char *title, const char *format, va_list args)
+static int __ui__warning(const char *title, const char *format, va_list args)
 {
 	char *s;
 
-	if (use_browser > 0 && vasprintf(&s, format, args) > 0) {
+	if (vasprintf(&s, format, args) > 0) {
 		int key;
 
 		pthread_mutex_lock(&ui__lock);
@@ -222,29 +222,22 @@ int __ui__warning(const char *title, const char *format, va_list args)
 		return key;
 	}
 
-	fprintf(stderr, "%s:\n", title);
+	fprintf(stderr, "%s\n", title);
 	vfprintf(stderr, format, args);
 	return K_ESC;
 }
 
-int ui__warning(const char *format, ...)
+static int perf_tui__error(const char *format, va_list args)
 {
-	int key;
-	va_list args;
-
-	va_start(args, format);
-	key = __ui__warning("Warning", format, args);
-	va_end(args);
-	return key;
+	return __ui__warning("Error:", format, args);
 }
 
-int ui__error(const char *format, ...)
+static int perf_tui__warning(const char *format, va_list args)
 {
-	int key;
-	va_list args;
-
-	va_start(args, format);
-	key = __ui__warning("Error", format, args);
-	va_end(args);
-	return key;
+	return __ui__warning("Warning:", format, args);
 }
+
+struct perf_error_ops perf_tui_eops = {
+	.error		= perf_tui__error,
+	.warning	= perf_tui__warning,
+};
