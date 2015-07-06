@@ -5,7 +5,7 @@
 #include "tests.h"
 #include "debug.h"
 
-int test__syscall_open_tp_fields(void)
+int test__syscall_openat_tp_fields(void)
 {
 	struct record_opts opts = {
 		.target = {
@@ -29,7 +29,7 @@ int test__syscall_open_tp_fields(void)
 		goto out;
 	}
 
-	evsel = perf_evsel__newtp("syscalls", "sys_enter_open");
+	evsel = perf_evsel__newtp("syscalls", "sys_enter_openat");
 	if (evsel == NULL) {
 		pr_debug("%s: perf_evsel__newtp\n", __func__);
 		goto out_delete_evlist;
@@ -45,7 +45,7 @@ int test__syscall_open_tp_fields(void)
 
 	perf_evsel__config(evsel, &opts);
 
-	evlist->threads->map[0] = getpid();
+	thread_map__set_pid(evlist->threads, 0, getpid());
 
 	err = perf_evlist__open(evlist);
 	if (err < 0) {
@@ -66,7 +66,7 @@ int test__syscall_open_tp_fields(void)
 	/*
 	 * Generate the event:
 	 */
-	open(filename, flags);
+	openat(AT_FDCWD, filename, flags);
 
 	while (1) {
 		int before = nr_events;
