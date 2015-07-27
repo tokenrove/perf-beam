@@ -3,13 +3,14 @@
 #include "thread_map.h"
 #include "cpumap.h"
 #include "debug.h"
+#include "stat.h"
 
-int test__open_syscall_event_on_all_cpus(void)
+int test__openat_syscall_event_on_all_cpus(void)
 {
 	int err = -1, fd, cpu;
 	struct cpu_map *cpus;
 	struct perf_evsel *evsel;
-	unsigned int nr_open_calls = 111, i;
+	unsigned int nr_openat_calls = 111, i;
 	cpu_set_t cpu_set;
 	struct thread_map *threads = thread_map__new(-1, getpid(), UINT_MAX);
 	char sbuf[STRERR_BUFSIZE];
@@ -27,7 +28,7 @@ int test__open_syscall_event_on_all_cpus(void)
 
 	CPU_ZERO(&cpu_set);
 
-	evsel = perf_evsel__newtp("syscalls", "sys_enter_open");
+	evsel = perf_evsel__newtp("syscalls", "sys_enter_openat");
 	if (evsel == NULL) {
 		if (tracefs_configured())
 			pr_debug("is tracefs mounted on /sys/kernel/tracing?\n");
@@ -46,7 +47,7 @@ int test__open_syscall_event_on_all_cpus(void)
 	}
 
 	for (cpu = 0; cpu < cpus->nr; ++cpu) {
-		unsigned int ncalls = nr_open_calls + cpu;
+		unsigned int ncalls = nr_openat_calls + cpu;
 		/*
 		 * XXX eventually lift this restriction in a way that
 		 * keeps perf building on older glibc installations
@@ -66,7 +67,7 @@ int test__open_syscall_event_on_all_cpus(void)
 			goto out_close_fd;
 		}
 		for (i = 0; i < ncalls; ++i) {
-			fd = open("/etc/passwd", O_RDONLY);
+			fd = openat(0, "/etc/passwd", O_RDONLY);
 			close(fd);
 		}
 		CPU_CLR(cpus->map[cpu], &cpu_set);
@@ -77,7 +78,7 @@ int test__open_syscall_event_on_all_cpus(void)
 	 * we use the auto allocation it will allocate just for 1 cpu,
 	 * as we start by cpu 0.
 	 */
-	if (perf_evsel__alloc_counts(evsel, cpus->nr) < 0) {
+	if (perf_evsel__alloc_counts(evsel, cpus->nr, 1) < 0) {
 		pr_debug("perf_evsel__alloc_counts(ncpus=%d)\n", cpus->nr);
 		goto out_close_fd;
 	}
@@ -96,10 +97,10 @@ int test__open_syscall_event_on_all_cpus(void)
 			break;
 		}
 
-		expected = nr_open_calls + cpu;
-		if (evsel->counts->cpu[cpu].val != expected) {
+		expected = nr_openat_calls + cpu;
+		if (perf_counts(evsel->counts, cpu, 0)->val != expected) {
 			pr_debug("perf_evsel__read_on_cpu: expected to intercept %d calls on cpu %d, got %" PRIu64 "\n",
-				 expected, cpus->map[cpu], evsel->counts->cpu[cpu].val);
+				 expected, cpus->map[cpu], perf_counts(evsel->counts, cpu, 0)->val);
 			err = -1;
 		}
 	}
@@ -110,6 +111,6 @@ out_close_fd:
 out_evsel_delete:
 	perf_evsel__delete(evsel);
 out_thread_map_delete:
-	thread_map__delete(threads);
+	thread_map__put(threads);
 	return err;
 }
