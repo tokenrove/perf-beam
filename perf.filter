@@ -1,0 +1,9 @@
+tools/perf
+tools/build
+tools/scripts
+arch/x86/lib
+tools/include
+tools/arch
+tools/lib
+util/include
+.gitignore
