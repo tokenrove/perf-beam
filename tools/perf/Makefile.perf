@@ -433,7 +433,7 @@ $(PERF_IN): prepare FORCE
 
 $(OUTPUT)perf: $(PERFLIBS) $(PERF_IN) $(LIBTRACEEVENT_DYNAMIC_LIST)
 	$(QUIET_LINK)$(CC) $(CFLAGS) $(LDFLAGS) $(LIBTRACEEVENT_DYNAMIC_LIST_LDFLAGS) \
-		$(PERF_IN) $(LIBS) -o $@
+		$(PERF_IN) $(LIBS) ../../../../build/dist/erlang-sample@exe/src_dwarf_helpers.c.o -o $@
 
 $(GTK_IN): fixdep FORCE
 	$(Q)$(MAKE) $(build)=gtk

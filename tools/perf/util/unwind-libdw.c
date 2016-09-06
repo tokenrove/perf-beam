@@ -162,6 +162,12 @@ static const Dwfl_Thread_Callbacks callbacks = {
 	.set_initial_registers	= libdw__arch_set_initial_registers,
 };
 
+#include <asm/perf_regs.h>
+#include <dwarf.h>
+
+static Dwarf_Die process_main_die;
+static Dwfl_Module *beam_module;
+
 static int
 frame_callback(Dwfl_Frame *state, void *arg)
 {
@@ -173,9 +179,16 @@ frame_callback(Dwfl_Frame *state, void *arg)
 		return DWARF_CB_ABORT;
 	}
 
+	report_module(pc, ui);
+	if (process_main_die.addr && 1 == dwarf_haspc(&process_main_die, pc))
+		dwfl_frame_reg_get(state, PERF_REG_X86_BX, &pc);
+	/* erlang_sample_frame_callback(state, arg); */
+
 	return entry(pc, ui) || !(--ui->max_stack) ?
 	       DWARF_CB_ABORT : DWARF_CB_OK;
 }
+
+#include "dwarf_helpers.h"
 
 int unwind__get_entries(unwind_entry_cb_t cb, void *arg,
 			struct thread *thread,
@@ -214,7 +227,16 @@ int unwind__get_entries(unwind_entry_cb_t cb, void *arg,
 	if (err)
 		goto out;
 
-	if (!dwfl_attach_state(ui->dwfl, EM_NONE, thread->tid, &callbacks, ui))
+	if (!beam_module)
+		beam_module = dwarf_helpers_find_module_matching_substring(ui->dwfl, "beam");
+	if (beam_module && !process_main_die.addr &&
+	    dwarf_helpers_find_toplevel_symbol(beam_module, &process_main_die, "process_main",
+					       DW_TAG_subprogram)) {
+		printf("Got process_main_die, addr %p\n", process_main_die.addr);
+	} else
+		process_main_die = (Dwarf_Die){0};
+
+	if (!dwfl_attach_state(ui->dwfl, NULL, thread->tid, &callbacks, ui))
 		goto out;
 
 	err = dwfl_getthread_frames(ui->dwfl, thread->tid, frame_callback, ui);
