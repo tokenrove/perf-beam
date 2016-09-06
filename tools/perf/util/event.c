@@ -329,12 +329,11 @@ int perf_event__synthesize_mmap_events(struct perf_tool *tool,
 		else
 			event->mmap2.flags |= MAP_PRIVATE;
 
-		if (prot[2] != 'x') {
-			if (!mmap_data || prot[0] != 'r')
-				continue;
-
-			event->header.misc |= PERF_RECORD_MISC_MMAP_DATA;
-		}
+		/* Previously, we turned on PERF_RECORD_MISC_MMAP_DATA
+		 * here, but we want to pretend non-exec sections
+		 * could be functions so they can have perf.maps
+		 * loaded for them. */
+		(void)mmap_data;
 
 out:
 		if (truncation)
