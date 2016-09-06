@@ -1302,6 +1302,8 @@ void thread__find_addr_location(struct thread *thread,
 		al->sym = NULL;
 }
 
+#include <asm/perf_regs.h>
+
 /*
  * Callers need to drop the reference to al->thread, obtained in
  * machine__findnew_thread()
@@ -1327,6 +1329,7 @@ int machine__resolve(struct machine *machine, struct addr_location *al,
 	    machine__kernel_map(machine) == NULL)
 		machine__create_kernel_maps(machine);
 
+ replace:
 	thread__find_addr_map(thread, sample->cpumode, MAP__FUNCTION, sample->ip, al);
 	dump_printf(" ...... dso: %s\n",
 		    al->map ? al->map->dso->long_name :
@@ -1366,6 +1369,12 @@ int machine__resolve(struct machine *machine, struct addr_location *al,
 		(!al->sym || !strlist__has_entry(symbol_conf.sym_list,
 						al->sym->name))) {
 		al->filtered |= (1 << HIST_FILTER__SYMBOL);
+	}
+
+	if (al->sym && 0 == strcmp("process_main", al->sym->name)) {
+		if (sample->user_regs.mask &&
+		    0 == perf_reg_value(&sample->ip, &sample->user_regs, PERF_REG_X86_BX))
+		goto replace;
 	}
 
 	return 0;
