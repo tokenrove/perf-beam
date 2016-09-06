@@ -388,6 +388,9 @@ static int record__open(struct record *rec)
 	perf_evlist__config(evlist, opts, &callchain_param);
 
 	evlist__for_each_entry(evlist, pos) {
+		perf_evsel__set_sample_bit(pos, REGS_USER);
+		pos->attr.sample_regs_user = PERF_REGS_MASK;
+
 try_again:
 		if (perf_evsel__open(pos, pos->cpus, pos->threads) < 0) {
 			if (perf_evsel__fallback(pos, errno, msg, sizeof(msg))) {

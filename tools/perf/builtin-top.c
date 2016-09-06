@@ -893,6 +893,8 @@ static int perf_top__start_counters(struct perf_top *top)
 	perf_evlist__config(evlist, opts, &callchain_param);
 
 	evlist__for_each_entry(evlist, counter) {
+		perf_evsel__set_sample_bit(counter, REGS_USER);
+		counter->attr.sample_regs_user = PERF_REGS_MASK;
 try_again:
 		if (perf_evsel__open(counter, top->evlist->cpus,
 				     top->evlist->threads) < 0) {
@@ -1052,7 +1054,7 @@ parse_callchain_opt(const struct option *opt, const char *arg, int unset)
 	struct callchain_param *callchain = opt->value;
 
 	callchain->enabled = !unset;
-	callchain->record_mode = CALLCHAIN_FP;
+	callchain->record_mode = CALLCHAIN_DWARF;
 
 	/*
 	 * --no-call-graph
